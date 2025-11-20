@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Collect UniFi AP 2.4GHz and 5GHz MACs via sshpass, parsing BusyBox ifconfig.
-# Input : ips.txt (one IP per line) in same dir
-# Output: wifi_macs.csv (ip,host,mac_24ghz,mac_5ghz_or_status)
+# Collect UniFi AP 5GHz MACs by SSID, using iwconfig on each AP.
+# Input : ips.csv (lines like "10.0.0.186,MainOfficeAP" with optional header) in same dir
+# Output: wifi_macs.csv (ip,host_or_friendly,mac_5ghz_or_status)
 
-set -u  
+set -u  # no unbound vars
 
-SSH_USER=""  # <-- SSH username
-SSH_PASS=""  # <-- SSH password
+SSH_USER=""         # <-- SSH username (e.g. C5xWnwtwo)
+SSH_PASS=""         # <-- SSH password
 SSH_PORT="22"
 CONNECT_TIMEOUT="6"
 NC_TIMEOUT="3"
 
+# SSID whose 5GHz BSSID you want (change this for the SSID Vocera cares about)
+SSID_FILTER=""   # e.g. "XYZ_SCHOOL", "XYZ_SCHOOL_Guests", "XYZ_SCHOOL_Students", etc.
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IPFILE="$SCRIPT_DIR/ips.txt"
+IPFILE="$SCRIPT_DIR/ips.csv"
 OUT="$SCRIPT_DIR/wifi_macs.csv"
 
-[ -f "$IPFILE" ] || { echo "Missing $IPFILE (one IP per line)"; exit 1; }
+[ -f "$IPFILE" ] || { echo "Missing $IPFILE (one IP per line, ip[,friendly_name])"; exit 1; }
 
 SSH_OPTS="-o ConnectTimeout=${CONNECT_TIMEOUT} \
   -o StrictHostKeyChecking=no \
@@ -27,83 +30,152 @@ SSH_OPTS="-o ConnectTimeout=${CONNECT_TIMEOUT} \
 
 port_22_state() {
   local ip="$1"
-  if nc -G "$NC_TIMEOUT" -zv "$ip" "$SSH_PORT" >/dev/null 2>&1; then echo "OPEN"; return; fi
-  if nc -G "$NC_TIMEOUT" -zv "$ip" "$SSH_PORT" 2>&1 | grep -qiE "timed out|Operation timed out"; then echo "TIMEOUT"; return; fi
+  if nc -G "$NC_TIMEOUT" -zv "$ip" "$SSH_PORT" >/dev/null 2>&1; then
+    echo "OPEN"
+    return
+  fi
+  if nc -G "$NC_TIMEOUT" -zv "$ip" "$SSH_PORT" 2>&1 | grep -qiE "timed out|Operation timed out"; then
+    echo "TIMEOUT"
+    return
+  fi
   echo "CLOSED"
 }
 
-echo "ip,host,mac_24ghz,mac_5ghz_or_status" > "$OUT"
+echo "ip,host_or_friendly,mac_5ghz_or_status" > "$OUT"
 
 process_ip() {
   local ip="$1"
+  local friendly="$2"
+
+  # Basic IPv4 sanity check
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "Skipping non-IP: $ip" >&2; return; }
 
-  case "$(port_22_state "$ip")" in
+  local label state out host body mac5
+
+  # Decide label (host/friendly column) up front
+  if [ -n "$friendly" ]; then
+    label="$friendly"
+  else
+    label="$ip"
+  fi
+
+  state="$(port_22_state "$ip")"
+  case "$state" in
     OPEN) : ;;
-    TIMEOUT) printf "%s,%s,,TIMEOUT_22\n" "$ip" "$ip" >> "$OUT"; return ;;
-    CLOSED)  printf "%s,%s,,CLOSED_22\n"  "$ip" "$ip" >> "$OUT"; return ;;
+    TIMEOUT)
+      printf "%s,%s,%s\n" "$ip" "$label" "TIMEOUT_22" >> "$OUT"
+      return
+      ;;
+    CLOSED)
+      printf "%s,%s,%s\n" "$ip" "$label" "CLOSED_22" >> "$OUT"
+      return
+      ;;
   esac
 
-  # Non-interactive auth probe 
+  # Quick auth probe
   if ! sshpass -p "$SSH_PASS" ssh $SSH_OPTS "$SSH_USER@$ip" "echo ok" </dev/null >/dev/null 2>&1; then
-    printf "%s,%s,,AUTH_FAILED\n" "$ip" "$ip" >> "$OUT"
+    printf "%s,%s,%s\n" "$ip" "$label" "AUTH_FAILED" >> "$OUT"
     return
   fi
 
-  # BusyBox sh + ifconfig parsing only
-  local out
-  out="$(sshpass -p "$SSH_PASS" ssh $SSH_OPTS "$SSH_USER@$ip" 'sh -s' </dev/null <<'REMOTE'
-PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"; export PATH
+  # Get hostname + iwconfig in one shot
+  out="$(sshpass -p "$SSH_PASS" ssh $SSH_OPTS "$SSH_USER@$ip" 'hostname; echo "-----"; iwconfig' </dev/null 2>/dev/null)" || out=""
 
-HOST="$( (hostname 2>/dev/null || echo unknown) | tr -d '\r' | tr -d ',' | tr -d '\n' )"
+  if [ -z "$out" ]; then
+    printf "%s,%s,%s\n" "$ip" "$label" "NO_OUTPUT" >> "$OUT"
+    return
+  fi
 
-# helper: keep only first 6 octets; normalize to uppercase with colons
-fmt6() { awk -F'[: -]' '{ if (NF>=6) printf "%02X:%02X:%02X:%02X:%02X:%02X\n","0x"$1,"0x"$2,"0x"$3,"0x"$4,"0x"$5,"0x"$6 }'; }
+  # First line = hostname
+  host="$(printf '%s\n' "$out" | head -n1 | tr -d '\r' | tr -d ',')"
+  # Everything after the separator is iwconfig body
+  body="$(printf '%s\n' "$out" | sed '1d' | sed '1{/^-----$/d;}')"
 
-MAC24="$(ifconfig wifi0 2>/dev/null | awk '/HWaddr/ {print $NF}' | tr 'a-f' 'A-F' | tr '-' ':' | fmt6)"
-MAC5="$( ifconfig wifi1 2>/dev/null | awk '/HWaddr/ {print $NF}' | tr 'a-f' 'A-F' | tr '-' ':' | fmt6)"
+  # Parse iwconfig output locally:
+  # - Track current ESSID
+  # - When we see a line with Frequency + Access Point and ESSID matches SSID_FILTER and freq is 5.x GHz, grab that BSSID.
+  mac5="$(
+    printf '%s\n' "$body" | awk -v ssid="$SSID_FILTER" '
+      {
+        line=$0
+      }
+      /ESSID:/ {
+        essid=line
+        sub(/.*ESSID:"/, "", essid)
+        sub(/".*$/, "", essid)
+        next
+      }
+      /Frequency:.*GHz/ && /Access Point:/ {
+        if (essid != ssid) next
+        freq=line
+        sub(/.*Frequency:/, "", freq)
+        sub(/GHz.*$/, "", freq)
+        gsub(/^[ \t]+|[ \t]+$/, "", freq)
+        if (freq !~ /^5\./) next
 
-# Fallback to ath* heuristic if wifi0/wifi1 missing
-if [ -z "$MAC24" ] || [ "$MAC24" = "00:00:00:00:00:00" ]; then
-  MAC24="$(ifconfig 2>/dev/null | awk '
-    /^ath[0-9]/ {iface=$1}
-    /HWaddr/    {gsub("-",
-":",$NF); m=toupper($NF); split(m,a,":"); if (length(m)>0) printf "%s:%s:%s:%s:%s:%s %s\n",a[1],a[2],a[3],a[4],a[5],a[6],iface}
-  ' | awk '/:24:/ {print $1; exit}')"
-fi
-if [ -z "$MAC5" ] || [ "$MAC5" = "00:00:00:00:00:00" ]; then
-  MAC5="$(ifconfig 2>/dev/null | awk '
-    /^ath[0-9]/ {iface=$1}
-    /HWaddr/    {gsub("-",
-":",$NF); m=toupper($NF); split(m,a,":"); if (length(m)>0) printf "%s:%s:%s:%s:%s:%s %s\n",a[1],a[2],a[3],a[4],a[5],a[6],iface}
-  ' | awk '/:25:/ {print $1; exit}')"
-fi
+        tmp=line
+        sub(/.*Access Point:[ \t]*/, "", tmp)
+        # tmp now starts with MAC, possibly followed by spaces / extra text
+        split(tmp, a, /[ \t]/)
+        bssid=a[1]
+        if (bssid == "") next
+        # normalize to upper case
+        bssid=toupper(bssid)
+        gsub(/-/, ":", bssid)
+        print bssid
+        exit
+      }
+    '
+  )"
 
-# Emit
-echo "HOST=$HOST"
-echo "MAC24=$MAC24"
-echo "MAC5=$MAC5"
-REMOTE
-)" || out=""
+  # Prefer friendly name > hostname > IP
+  if [ -n "$friendly" ]; then
+    label="$friendly"
+  elif [ -n "$host" ]; then
+    label="$host"
+  else
+    label="$ip"
+  fi
 
-  # Parse returned lines
-  local host mac24 mac5
-  host="$(printf "%s\n" "$out" | awk -F= '/^HOST=/{print $2}' | tr -d '\r\n,')"
-  mac24="$(printf "%s\n" "$out" | awk -F= '/^MAC24=/{print $2}' | tr -d '\r\n')"
-  mac5="$( printf "%s\n" "$out" | awk -F= '/^MAC5=/{print $2}'  | tr -d '\r\n')"
-  [ -z "$host" ] && host="$ip"
-  [ -z "$mac24" ] && mac24="NOT_FOUND"
-  [ -z "$mac5" ]  && mac5="NOT_FOUND"
+  if [ -z "$mac5" ]; then
+    mac5="NOT_FOUND"
+  fi
 
-  printf "%s,%s,%s,%s\n" "$ip" "$host" "$mac24" "$mac5" >> "$OUT"
+  printf "%s,%s,%s\n" "$ip" "$label" "$mac5" >> "$OUT"
 }
 
-# Read ips.txt 
+# Read ips.csv with "ip[,friendly]" format
+# Example:
+# ip,friendlyName
+# 10.0.0.186,MainOfficeAP
+# 10.0.1.200,1stGradeAP
 exec 3<"$IPFILE"
-while IFS= read -r ip <&3; do
-  ip="$(echo "$ip" | tr -d '[:space:]')"
+while IFS= read -r line <&3; do
+  # Trim CR
+  line="$(echo "$line" | tr -d '\r')"
+  # Skip blank or comment lines
+  [ -z "$line" ] && continue
+  case "$line" in
+    \#*) continue ;;
+  esac
+
+  # Skip header row if present (starts with "ip," or equals "ip")
+  case "$line" in
+    ip,*|ip) continue ;;
+  esac
+
+  ip=""
+  friendly=""
+
+  if printf "%s" "$line" | grep -q ','; then
+    ip="$(printf "%s" "$line" | cut -d',' -f1 | tr -d '[:space:]')"
+    friendly="$(printf "%s" "$line" | cut -d',' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  else
+    ip="$(echo "$line" | tr -d '[:space:]')"
+  fi
+
   [ -z "$ip" ] && continue
-  process_ip "$ip"
+  process_ip "$ip" "$friendly"
 done
 exec 3<&-
 
